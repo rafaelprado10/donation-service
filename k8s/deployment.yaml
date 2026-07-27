@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: donation-service
+  namespace: donation-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: donation-service
+  template:
+    metadata:
+      labels:
+        app: donation-service
+    spec:
+      containers:
+        - name: donation-service
+          image: 434473100946.dkr.ecr.us-east-1.amazonaws.com/donation-service:v1.0.0
+          ports:
+            - containerPort: 8082
+              name: http
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: donation-service-secrets
+                  key: DATABASE_URL
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

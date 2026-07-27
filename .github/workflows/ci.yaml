@@ -1,0 +1,251 @@
+name: auth-service-CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build_test:
+    name: Build & Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run unit tests
+        run: go test -v ./...
+
+  lint:
+    name: Linter / Static Analysis
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          go-version-file: go.mod
+
+  security_scan:
+    name: Security Scan (SAST & SCA)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: SAST with gosec (report only)
+        continue-on-error: true
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -severity high ./...
+
+      - name: SCA with Trivy (fail on CRITICAL)
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            aquasec/trivy:0.63.0 fs \
+            --severity CRITICAL \
+            --exit-code 1 \
+            --ignore-unfixed \
+            /src
+
+  compute_release_tag:
+    name: Compute release tag
+    runs-on: ubuntu-latest
+    needs: security_scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+    outputs:
+      release_tag: ${{ steps.tag.outputs.release_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next semantic version tag
+        id: tag
+        run: |
+          git fetch --tags --force origin
+          LAST_TAG="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n1)"
+          if [ -z "${LAST_TAG}" ]; then
+            NEXT_TAG="v1.0.0"
+          else
+            VERSION="${LAST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${VERSION}"
+            PATCH=$((PATCH + 1))
+            NEXT_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+          echo "release_tag=${NEXT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Using release tag: ${NEXT_TAG}"
+
+  docker_build_push:
+    name: Docker Build & Push (ECR)
+    runs-on: ubuntu-latest
+    needs: compute_release_tag
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+    outputs:
+      image_tag: ${{ steps.image.outputs.tag }}
+    env:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+      IMAGE_VERSION: ${{ needs.compute_release_tag.outputs.release_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate AWS account and ECR settings
+        run: |
+          if [ -z "${AWS_ACCOUNT_ID}" ] || [ -z "${AWS_REGION}" ] || [ -z "${ECR_REPOSITORY}" ]; then
+            echo "Missing required secrets: AWS_ACCOUNT_ID, AWS_REGION, or ECR_REPOSITORY"
+            exit 1
+          fi
+          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          if [ "${CALLER_ACCOUNT}" != "${AWS_ACCOUNT_ID}" ]; then
+            echo "OIDC role authenticated in account ${CALLER_ACCOUNT}, but AWS_ACCOUNT_ID secret is ${AWS_ACCOUNT_ID}"
+            exit 1
+          fi
+
+      - name: Log in to AWS ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: image
+        run: |
+          IMAGE_TAG="${IMAGE_VERSION}"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: docker build -t "${{ steps.image.outputs.uri }}" .
+
+      - name: Container scan with Trivy (fail on HIGH/CRITICAL)
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.63.0 image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --skip-version-check \
+            "${{ steps.image.outputs.uri }}"
+
+      - name: Push image to AWS ECR
+        run: docker push "${{ steps.image.outputs.uri }}"
+
+  update_manifest_in_repo:
+    name: Update manifest image tag in current repository
+    runs-on: ubuntu-latest
+    needs: [compute_release_tag, docker_build_push]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Update deployment image tag
+        env:
+          RELEASE_TAG: ${{ needs.compute_release_tag.outputs.release_tag }}
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+        run: |
+          MANIFEST_PATH=""
+          if [ -f "k8s/deployment.yaml" ]; then
+            MANIFEST_PATH="k8s/deployment.yaml"
+          elif [ -f "deployment.yaml" ]; then
+            MANIFEST_PATH="deployment.yaml"
+          fi
+
+          if [ -z "${MANIFEST_PATH}" ]; then
+            echo "No deployment manifest found. Skipping manifest update."
+            exit 0
+          fi
+
+          IMAGE_PREFIX="${ECR_REGISTRY}/${ECR_REPOSITORY}:"
+          if ! grep -En "image:[[:space:]]*${ECR_REGISTRY}/${ECR_REPOSITORY}:" "${MANIFEST_PATH}" >/dev/null; then
+            echo "Manifest image does not match expected prefix: ${IMAGE_PREFIX}"
+            echo "Current image line(s):"
+            grep -En "image:" "${MANIFEST_PATH}" || true
+            exit 1
+          fi
+
+          sed -i -E "s|(image:\\s*${ECR_REGISTRY}/${ECR_REPOSITORY}:).*|\\1${RELEASE_TAG}|g" "${MANIFEST_PATH}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${MANIFEST_PATH}"
+          git commit -m "chore(deploy): update image tag to ${RELEASE_TAG}" || echo "No changes to commit"
+          git push origin main
+
+  tag_current_repo:
+    name: Create tag in current repository
+    runs-on: ubuntu-latest
+    needs: [compute_release_tag, docker_build_push, update_manifest_in_repo]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Create and push tag
+        env:
+          RELEASE_TAG: ${{ needs.compute_release_tag.outputs.release_tag }}
+          SOURCE_IMAGE_TAG: ${{ needs.docker_build_push.outputs.image_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --tags origin
+          git pull --ff-only origin main
+
+          if git ls-remote --tags origin "refs/tags/${RELEASE_TAG}" | grep -q "${RELEASE_TAG}"; then
+            echo "Tag ${RELEASE_TAG} already exists in current repository. Skipping."
+            exit 0
+          fi
+
+          CURRENT_SHA="$(git rev-parse HEAD)"
+          git tag -a "${RELEASE_TAG}" -m "Release ${RELEASE_TAG} from ${GITHUB_REPOSITORY}@${CURRENT_SHA} (image ${SOURCE_IMAGE_TAG})"
+          git push origin "refs/tags/${RELEASE_TAG}"
