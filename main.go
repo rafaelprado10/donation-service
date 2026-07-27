@@ -64,7 +64,11 @@ func main() {
 		log.Fatalf("Erro ao conectar no PostgreSQL: %v", err)
 	}
 
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.Printf("erro ao fechar conexão com banco: %v", err)
+		}
+	}()
 
 	log.Println("PostgreSQL conectado com sucesso")
 
