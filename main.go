@@ -257,7 +257,11 @@ func (a *App) createDonation(
 	tid string,
 ) {
 
-	defer r.Body.Close()
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			log.Printf("erro ao fechar request body: %v", err)
+		}
+	}()
 
 	r.Body = http.MaxBytesReader(
 		w,
@@ -433,7 +437,11 @@ func (a *App) listDonations(
 		return
 	}
 
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("erro ao fechar rows: %v", err)
+		}
+	}()
 
 	donations := []Donation{}
 
