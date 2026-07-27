@@ -479,7 +479,7 @@ func (a *App) listDonations(
 		return
 	}
 
-	if err := json.NewEncoder(w).Encode(donation); err != nil {
+	if err := json.NewEncoder(w).Encode(donations); err != nil {
 		log.Printf("erro ao responder JSON: %v", err)
 	}
 
