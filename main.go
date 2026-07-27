@@ -193,12 +193,14 @@ func (a *App) HealthHandler(
 
 	w.WriteHeader(http.StatusOK)
 
-	json.NewEncoder(w).Encode(
+	if err := json.NewEncoder(w).Encode(
 		map[string]string{
 			"status":  "ok",
 			"service": "donation-service",
 		},
-	)
+	); err != nil {
+		log.Printf("erro ao escrever resposta JSON: %v", err)
+	}
 }
 
 func (a *App) DonationHandler(
@@ -477,7 +479,9 @@ func (a *App) listDonations(
 		return
 	}
 
-	json.NewEncoder(w).Encode(donations)
+	if err := json.NewEncoder(w).Encode(donation); err != nil {
+		log.Printf("erro ao responder JSON: %v", err)
+	}
 
 	a.Log(
 		tid,
