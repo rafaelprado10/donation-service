@@ -1,4 +1,4 @@
-name: auth-service-CI
+name: donation-service-CI
 
 on:
   push:
@@ -125,6 +125,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Debug AWS role
+        run: |
+          echo "ROLE=${{ secrets.AWS_ROLE_ARN }}"
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
